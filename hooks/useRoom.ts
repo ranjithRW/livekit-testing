@@ -5,7 +5,15 @@ import { toastAlert } from '@/components/livekit/alert-toast';
 
 export function useRoom(appConfig: AppConfig) {
   const aborted = useRef(false);
-  const room = useMemo(() => new Room(), []);
+  const room = useMemo(() => {
+    const r = new Room({
+      // Increase connection timeout to 30 seconds
+      connectTimeout: 30000,
+      // Enable adaptive stream
+      adaptiveStream: true,
+    });
+    return r;
+  }, []);
   const [isSessionActive, setIsSessionActive] = useState(false);
 
   useEffect(() => {
@@ -22,10 +30,20 @@ export function useRoom(appConfig: AppConfig) {
 
     room.on(RoomEvent.Disconnected, onDisconnected);
     room.on(RoomEvent.MediaDevicesError, onMediaDevicesError);
+    room.on(RoomEvent.ConnectionStateChanged, (state) => {
+      console.log('Room connection state changed:', state);
+      if (state === 'disconnected' || state === 'reconnecting') {
+        // Don't set session inactive on reconnecting, only on disconnect
+        if (state === 'disconnected') {
+          setIsSessionActive(false);
+        }
+      }
+    });
 
     return () => {
       room.off(RoomEvent.Disconnected, onDisconnected);
       room.off(RoomEvent.MediaDevicesError, onMediaDevicesError);
+      room.off(RoomEvent.ConnectionStateChanged);
     };
   }, [room]);
 
@@ -59,10 +77,19 @@ export function useRoom(appConfig: AppConfig) {
                 : undefined,
             }),
           });
-          return await res.json();
+
+          if (!res.ok) {
+            const errorText = await res.text();
+            console.error('Connection details API error:', errorText);
+            throw new Error(`Failed to get connection details: ${errorText}`);
+          }
+
+          const data = await res.json();
+          console.log('Connection details received:', { serverUrl: data.serverUrl, roomName: data.roomName });
+          return data;
         } catch (error) {
           console.error('Error fetching connection details:', error);
-          throw new Error('Error fetching connection details!');
+          throw error instanceof Error ? error : new Error('Error fetching connection details!');
         }
       }),
     [appConfig]
@@ -78,9 +105,14 @@ export function useRoom(appConfig: AppConfig) {
       tokenSource
         .fetch({ agentName: appConfig.agentName })
         .then((connectionDetails) => {
-          return room.connect(connectionDetails.serverUrl, connectionDetails.participantToken);
+          console.log('Connecting to room:', connectionDetails.roomName);
+          return room.connect(connectionDetails.serverUrl, connectionDetails.participantToken, {
+            // Connection options
+            autoSubscribe: true,
+          });
         })
         .then(async () => {
+          console.log('Room connected, enabling microphone...');
           // Wait for room to be fully connected before enabling microphone
           // The connect() promise resolves when connected, but ensure state is ready
           if (room.state !== 'connected') {
@@ -99,9 +131,16 @@ export function useRoom(appConfig: AppConfig) {
           }
           
           // Now that room is connected, enable microphone
-          return room.localParticipant.setMicrophoneEnabled(true, undefined, {
-            preConnectBuffer: isPreConnectBufferEnabled,
-          });
+          try {
+            await room.localParticipant.setMicrophoneEnabled(true, undefined, {
+              preConnectBuffer: isPreConnectBufferEnabled,
+            });
+            console.log('Microphone enabled');
+          } catch (micError) {
+            console.error('Error enabling microphone:', micError);
+            // Don't fail the whole session if mic fails, but log it
+            throw micError;
+          }
         })
         .catch((error) => {
           if (aborted.current) {
@@ -113,10 +152,24 @@ export function useRoom(appConfig: AppConfig) {
             return;
           }
 
+          console.error('Session start error:', error);
+          
+          // Ensure room is disconnected on error
+          if (room.state !== 'disconnected') {
+            room.disconnect().catch(console.error);
+          }
+
           setIsSessionActive(false);
+          
+          // Provide more helpful error messages
+          let errorMessage = error.message || 'Unknown error';
+          if (errorMessage.includes('timeout') || errorMessage.includes('signal')) {
+            errorMessage = 'Connection timeout. Please check your LiveKit server configuration and environment variables.';
+          }
+
           toastAlert({
             title: 'There was an error connecting to the agent',
-            description: `${error.name}: ${error.message}`,
+            description: `${error.name}: ${errorMessage}`,
           });
         });
     }
