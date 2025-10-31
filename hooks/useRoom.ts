@@ -73,30 +73,52 @@ export function useRoom(appConfig: AppConfig) {
 
     if (room.state === 'disconnected') {
       const { isPreConnectBufferEnabled } = appConfig;
-      Promise.all([
-        room.localParticipant.setMicrophoneEnabled(true, undefined, {
-          preConnectBuffer: isPreConnectBufferEnabled,
-        }),
-        tokenSource
-          .fetch({ agentName: appConfig.agentName })
-          .then((connectionDetails) =>
-            room.connect(connectionDetails.serverUrl, connectionDetails.participantToken)
-          ),
-      ]).catch((error) => {
-        if (aborted.current) {
-          // Once the effect has cleaned up after itself, drop any errors
-          //
-          // These errors are likely caused by this effect rerunning rapidly,
-          // resulting in a previous run `disconnect` running in parallel with
-          // a current run `connect`
-          return;
-        }
+      
+      // First connect to the room, then enable microphone after connection is established
+      tokenSource
+        .fetch({ agentName: appConfig.agentName })
+        .then((connectionDetails) => {
+          return room.connect(connectionDetails.serverUrl, connectionDetails.participantToken);
+        })
+        .then(async () => {
+          // Wait for room to be fully connected before enabling microphone
+          // The connect() promise resolves when connected, but ensure state is ready
+          if (room.state !== 'connected') {
+            await new Promise<void>((resolve) => {
+              const onConnected = () => {
+                room.off(RoomEvent.Connected, onConnected);
+                resolve();
+              };
+              room.on(RoomEvent.Connected, onConnected);
+              // Timeout safety
+              setTimeout(() => {
+                room.off(RoomEvent.Connected, onConnected);
+                resolve();
+              }, 5000);
+            });
+          }
+          
+          // Now that room is connected, enable microphone
+          return room.localParticipant.setMicrophoneEnabled(true, undefined, {
+            preConnectBuffer: isPreConnectBufferEnabled,
+          });
+        })
+        .catch((error) => {
+          if (aborted.current) {
+            // Once the effect has cleaned up after itself, drop any errors
+            //
+            // These errors are likely caused by this effect rerunning rapidly,
+            // resulting in a previous run `disconnect` running in parallel with
+            // a current run `connect`
+            return;
+          }
 
-        toastAlert({
-          title: 'There was an error connecting to the agent',
-          description: `${error.name}: ${error.message}`,
+          setIsSessionActive(false);
+          toastAlert({
+            title: 'There was an error connecting to the agent',
+            description: `${error.name}: ${error.message}`,
+          });
         });
-      });
     }
   }, [room, appConfig, tokenSource]);
 
